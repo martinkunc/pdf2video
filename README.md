@@ -19,6 +19,23 @@ See [docs/DESIGN.md](docs/DESIGN.md) for the design.
 
 ## Install
 
+### Prebuilt packages
+
+Each [GitHub release](../../releases) has standalone packages that include Python,
+GTK and ffmpeg:
+
+- **Windows**: `pdf2video-<version>-windows-x86_64.zip`. Unzip it and run
+  `pdf2video.exe` (GUI) or `pdf2video-cli.exe` (command line).
+- **macOS**: `pdf2video-<version>-macos-arm64.dmg` (Apple Silicon) or `…-x86_64.dmg`
+  (Intel). Drag `pdf2video.app` to Applications. The app isn't signed, so on first
+  launch right-click it → **Open**, or run `xattr -dr com.apple.quarantine /Applications/pdf2video.app`.
+- **Linux**: `pdf2video-<version>-linux-x86_64.tar.gz`. Unpack it and run `pdf2video/pdf2video`.
+
+OCR still needs a system Tesseract (see [OCR](#ocr)). Voices and AI models are
+downloaded on first use, as usual.
+
+### From source
+
 System dependencies (macOS / Homebrew):
 
 ```sh
@@ -55,8 +72,14 @@ uv run pdf2video book.epub  # GUI with a document preloaded
 
 ### Voices
 
-- **Microsoft Edge neural voices** (default): high quality and many languages.
-  Needs an internet connection.
+- **Kokoro neural voices** (default): **fully offline** and the most natural
+  sounding, with good intonation and pauses. English (US and UK, about 30 voices;
+  the default is `af_heart`), Spanish, French, Italian, Portuguese and Hindi. The
+  model (350 MB) is downloaded on first use into `~/.cache/pdf2video/kokoro`.
+  About 6–8× faster than real time on Apple Silicon. For other languages (Czech,
+  German, …) a Piper voice is used automatically.
+- **Microsoft Edge neural voices**: high quality and many languages (also a good
+  Czech voice). Needs an internet connection.
 - **Piper neural voices**: **fully offline**, 50+ languages including Czech
   (e.g. `cs_CZ-jirka-medium`). The chosen voice (60–120 MB) is downloaded
   automatically the first time it's used, into `~/.cache/pdf2video/voices`.
@@ -66,7 +89,7 @@ uv run pdf2video book.epub  # GUI with a document preloaded
   *Enhanced* voices sound best. Download them in System Settings →
   Accessibility → Spoken Content → System voice → Manage Voices.
 
-For a completely offline setup, use Piper voices together with the built-in AI
+For a completely offline setup, use Kokoro (or Piper) voices together with the built-in AI
 model.
 
 The voice is chosen automatically from the document's language unless you pick
@@ -108,6 +131,15 @@ and an **animation**: diagrams can build up item by item while the narrator
 explains them or fade in, and pictures can slowly zoom, pan or fade in. At most
 60 % of the scenes get an illustration.
 
+**Book images.** If the chapter has images of its own (figures, photos, maps), they
+are saved in `<name>_video/book_images/` and a local vision model (`qwen3-vl-4b`,
+3.0 GB, downloaded on first use) writes a short summary of each into
+`book_images.json`. Before any picture is generated, the AI compares the picture it
+planned with the book's images and uses the original where it fits the scene
+better. Its choice and the reason are in `script.json` (`book_image`,
+`book_image_reason`). Turn this off with the **Book images** switch or
+`--no-book-images`.
+
 Pictures are saved in `<name>_video/illustrations/` and reused when you re-render.
 You can edit a prompt, placement or animation in `script.json` and run
 `video --reuse-script --illustrations`, or replace a PNG with your own image.
@@ -136,10 +168,12 @@ uv run pdf2video-cli voices --engine piper --language cs
 uv run pdf2video-cli models                                # local/downloadable LLMs
 uv run pdf2video-cli models --pull qwen3:4b                # download a model
 uv run pdf2video-cli models --pull-image sdxl-turbo        # download an image model
+uv run pdf2video-cli models --pull-vision qwen3-vl-4b      # download the vision model
 ```
 
 `uv run pdf2video audio book.pdf` works too. Run `pdf2video-cli COMMAND --help`
 for all options (`--engine`, `--voice`, `--rate`, `--script-mode`, `--image-model`,
+`--vision-model`, `--book-images`,
 `--ocr-lang`, …).
 
 Settings are stored in `~/.config/pdf2video/settings.toml`.
@@ -150,3 +184,27 @@ Settings are stored in `~/.config/pdf2video/settings.toml`.
 uv run pytest
 uv run ruff check src tests && uv run ruff format src tests
 ```
+
+### Building packages
+
+`packaging/build.py` builds a standalone package for the current OS with
+[PyInstaller](https://pyinstaller.org). It downloads static ffmpeg/ffprobe into
+`packaging/ffmpeg/`, bundles them, and writes a `.zip` (Windows), `.dmg` (macOS) or
+`.tar.gz` (Linux) to `dist/`:
+
+```sh
+uv sync --group build --no-binary-package pillow --reinstall-package pillow  # macOS
+uv sync --group build                                                        # Linux
+uv run --no-sync python packaging/build.py
+```
+
+On macOS, Pillow must be built from source so that it uses the same Homebrew
+harfbuzz/freetype as GTK. Pillow's wheel ships its own copies, and they stop GTK
+from loading in the bundle. On Windows, GTK comes from
+[gvsbuild](https://github.com/wingtk/gvsbuild); see the workflow for the setup.
+
+When a GitHub release is published, `.github/workflows/release.yml` builds the
+packages for Windows, macOS (arm64 and x86_64) and Linux and attaches them to the
+release. It can also be started by hand from the Actions tab, and then it only uploads
+them as workflow artifacts.
+# pdf2video
