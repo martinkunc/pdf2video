@@ -107,6 +107,7 @@ jobs:
       # harfbuzz/freetype as GTK (the wheel's own copies break GTK in the bundle).
       # pygobject/pycairo are built from source against the installed GTK everywhere.
       - name: Python dependencies
+        if: runner.os != 'Windows'
         shell: bash
         env:
           CMAKE_ARGS: ${{ matrix.cmake_args }}
@@ -114,6 +115,13 @@ jobs:
           args=(--locked --group build --no-dev)
           if [ "$RUNNER_OS" = "macOS" ]; then args+=(--no-binary-package pillow); fi
           uv sync "${args[@]}"
+
+      # Not Git Bash: it puts its /usr/bin first on PATH, and that GNU link.exe
+      # shadows MSVC's linker, so meson fails to build pygobject.
+      - name: Python dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: uv sync --locked --group build --no-dev
 
       - name: Build package
         shell: bash
