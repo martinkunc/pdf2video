@@ -12,13 +12,15 @@ from PIL import Image
 from .. import media
 from ..audiobook import OutputResult, part_filenames
 from ..jobs import JobContext
-from ..model import Document
+from ..model import ChapterImage, Document
 from ..narration import Narrator
 from ..settings import Settings
 from ..textutil import plan_parts, split_sentences
 from ..tts import TTSEngine
+from .bookimages import by_chapter, prepare_book_images
+from .bookimages import collect as collect_book_images
 from .diagrams import render_diagram, reveal_steps
-from .script import Illustration, Scene, VideoScript, build_script
+from .script import Illustration, Scene, VideoScript, build_script, show_mentioned_figures
 from .slides import fit_rect, illustration_box, render_scene_slide, render_title_slide
 
 log = logging.getLogger(__name__)
@@ -49,12 +51,18 @@ class _SlidePlan:
 
 @dataclass
 class _Pictures:
-    """Generated pictures for the script's picture illustrations (prompt → file)."""
+    """The files for the script's picture illustrations: generated (prompt → file)
+    or, where the AI chose one, the book's own image."""
 
+    root: Path  # the video folder
     files: dict[tuple[str, str], Path] = field(default_factory=dict)
 
+    def book_image(self, ill: Illustration) -> Path | None:
+        path = self.root / ill.book_image if ill.book_image else None
+        return path if path is not None and path.is_file() else None
+
     def get(self, ill: Illustration) -> Path | None:
-        return self.files.get((ill.prompt, ill.placement))
+        return self.book_image(ill) or self.files.get((ill.prompt, ill.placement))
 
 
 @dataclass
@@ -126,13 +134,21 @@ def _generate_pictures(
     from .. import imagegen
     from ..llm import unload as unload_llm
 
-    pictures = _Pictures()
-    wanted = [
-        s.illustration
-        for section in script.sections
-        for s in section.scenes
-        if s.illustration is not None and s.illustration.kind == "picture"
-    ]
+    pictures = _Pictures(out_dir)
+    wanted = []
+    for section in script.sections:
+        for scene in section.scenes:
+            ill = scene.illustration
+            if ill is None or ill.kind != "picture":
+                continue
+            if pictures.book_image(ill) is not None:
+                ill.image = ill.book_image  # the AI chose the book's own image
+            elif not ill.prompt:
+                ill.image = ""  # a book image that is gone, and nothing to generate
+            else:
+                if ill.book_image:
+                    log.warning("%s is missing; generating a picture instead", ill.book_image)
+                wanted.append(ill)
     if not wanted:
         return pictures
     generator = imagegen.ImageGenerator(settings.image_model, settings.llm_auto_download)
@@ -188,7 +204,7 @@ def _scene_slide(
     scene: Scene,
     footer: str,
     progress: float,
-    doc_image: bytes | None,
+    doc_image: ChapterImage | None,
     pictures: _Pictures | None,
 ) -> _SlidePlan:
     """Render a scene's slide(s) and decide how they are animated."""
@@ -230,7 +246,7 @@ def _scene_slide(
             return _SlidePlan([base], "motion", fitted, (rect[0], rect[1]), ill.animation)
         return _SlidePlan([render(placement=ill.placement, picture=picture, picture_rect=rect)])
 
-    return _SlidePlan([render(image=doc_image)])
+    return _SlidePlan([render(image=doc_image.data if doc_image else None)])
 
 
 def _encode(plan: _SlidePlan, audio, out: Path, ctx: JobContext) -> None:
@@ -264,24 +280,47 @@ def make_video(
     out_dir.mkdir(parents=True, exist_ok=True)
     result = OutputResult(out_dir)
 
-    # Phase 1: script.
+    # Phase 1: the book's own images (captured and summarised), then the script.
     if script is None:
         mode = settings.video_script
         llm = settings.llm() if mode != "extractive" else None
         uses_ai = llm is not None and llm.status(check_remote=False).ok
-        script_share = 0.5 if uses_ai else 0.02
-        ctx.progress(0.0, "Preparing script…")
+        book_images = {}
+        book_share = 0.0
+        if uses_ai and settings.illustrations and settings.book_images:
+            if any(c.images for c in doc.chapters):
+                book_share = 0.1
+            book_images = prepare_book_images(
+                doc,
+                out_dir,
+                settings.vision_model,
+                settings.llm_auto_download,
+                lambda f, message: ctx.progress(book_share * f, message),
+                ctx.check,
+            )
+        script_share = book_share + (0.5 if uses_ai else 0.02)
+        ctx.progress(book_share, "Preparing script…")
         script = build_script(
             doc,
             mode,
             narrator.language,
             llm,
-            on_progress=lambda f, message: ctx.progress(script_share * f, message),
+            on_progress=lambda f, message: ctx.progress(
+                book_share + (script_share - book_share) * f, message
+            ),
             check_cancel=ctx.check,
             illustrations=settings.illustrations,
+            book_images=book_images,
         )
     else:
         script_share = 0.0
+        if settings.illustrations:
+            # The files a reused script may refer to; figures the narration mentions.
+            book_images = by_chapter(collect_book_images(doc, out_dir))
+            if settings.book_images:
+                for section in script.sections:
+                    if section.source == "ai" and section.number in book_images:
+                        show_mentioned_figures(section, book_images[section.number])
         # A reused script may cover more chapters than are selected now.
         numbers = {c.number for c in doc.chapters}
         titles = {c.title for c in doc.chapters}
@@ -337,6 +376,8 @@ def make_video(
                 None,
             )
             images = chapter.images if chapter else []
+            if pictures is not None and settings.book_images and section.source == "ai":
+                images = []  # the book's images appear only where the AI chose them
             number = section.number or (chapter.number if chapter else ch_index + 1)
             label = f"chapter {number} ({ch_index + 1}/{n_chapters})"
             prefix = f"c{ch_index:03d}"

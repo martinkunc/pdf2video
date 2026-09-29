@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
@@ -16,7 +17,7 @@ def config_path() -> Path:
 @dataclass
 class Settings:
     max_chapter_minutes: float = 10.0
-    tts_engine: str = "edge"  # "edge" | "macos"
+    tts_engine: str = "kokoro"  # "kokoro" (default) | "piper" | "edge" | "macos"
     voice: str = ""  # empty = pick automatically from the document language
     rate: float = 1.0  # speaking speed multiplier
     video_script: str = "auto"  # "auto" | "ai" | "extractive"
@@ -24,6 +25,8 @@ class Settings:
     llm_auto_download: bool = True  # download the models on first use if missing
     illustrations: bool = False  # AI adds diagrams / generated pictures to some scenes
     image_model: str = "sdxl-turbo"  # see pdf2video.imagegen.IMAGE_MODELS, or a file path
+    book_images: bool = True  # with illustrations: may show the book's own images instead
+    vision_model: str = "qwen3-vl-4b"  # describes the book's images (llm.vision.VISION_MODELS)
     ocr: str = "auto"  # "auto" (scanned pages only) | "always" | "off"
     ocr_languages: str = "auto"  # Tesseract codes, e.g. "eng+ces", or "auto"
     bitrate: str = "64k"
@@ -49,7 +52,10 @@ class Settings:
         if not path.exists():
             return settings
         try:
-            data = tomllib.loads(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            # Older versions wrote Python booleans (True/False), which TOML rejects.
+            text = re.sub(r"= (True|False)\s*$", lambda m: f"= {m[1].lower()}", text, flags=re.M)
+            data = tomllib.loads(text)
         except (OSError, tomllib.TOMLDecodeError):
             return settings
         for f in fields(cls):
@@ -67,6 +73,8 @@ class Settings:
             if isinstance(value, str):
                 escaped = value.replace("\\", "\\\\").replace('"', '\\"')
                 lines.append(f'{key} = "{escaped}"')
+            elif isinstance(value, bool):  # TOML booleans are lowercase
+                lines.append(f"{key} = {str(value).lower()}")
             else:
                 lines.append(f"{key} = {value}")
         path.write_text("\n".join(lines) + "\n", encoding="utf-8")

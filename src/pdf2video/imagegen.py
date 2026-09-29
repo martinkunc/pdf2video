@@ -186,7 +186,11 @@ def dimensions(model: ImageModel, aspect: float) -> tuple[int, int]:
 
 def unload() -> None:
     global _loaded
-    with _lock:
+    # A picture being drawn can't be interrupted; don't wait for it forever.
+    if not _lock.acquire(timeout=30):
+        log.warning("image model still busy; not freeing it")
+        return
+    try:
         if _loaded is None:
             return
         sd = _loaded[1]
@@ -195,6 +199,8 @@ def unload() -> None:
             sd.close()
         except Exception:  # pragma: no cover - best effort
             log.debug("closing the image model failed", exc_info=True)
+    finally:
+        _lock.release()
     gc.collect()
 
 

@@ -12,6 +12,7 @@ Examples::
     pdf2video-cli models
     pdf2video-cli models --pull qwen3:4b
     pdf2video-cli models --pull-image sdxl-turbo
+    pdf2video-cli models --pull-vision qwen3-vl-4b
 """
 
 from __future__ import annotations
@@ -95,6 +96,15 @@ def _build_parser() -> argparse.ArgumentParser:
     llm_opts.add_argument(
         "--image-model", help="image model for pictures (e.g. sdxl-turbo) or a checkpoint path"
     )
+    llm_opts.add_argument(
+        "--book-images",
+        action=argparse.BooleanOptionalAction,
+        help="with --illustrations: show the book's own image where it fits better "
+        "than a generated picture",
+    )
+    llm_opts.add_argument(
+        "--vision-model", help="model that describes the book's images (e.g. qwen3-vl-4b)"
+    )
 
     sub.add_parser("info", parents=[doc_opts], help="show detected chapters")
     text = sub.add_parser("text", parents=[doc_opts], help="print the extracted text")
@@ -118,6 +128,7 @@ def _build_parser() -> argparse.ArgumentParser:
     models.add_argument("--pull", metavar="NAME", help="download a model, e.g. qwen3:4b")
     models.add_argument("--model", help="model to check (default from settings)")
     models.add_argument("--pull-image", metavar="NAME", help="download an image model")
+    models.add_argument("--pull-vision", metavar="NAME", help="download a vision model")
     return parser
 
 
@@ -133,6 +144,8 @@ def _apply_overrides(settings: Settings, args: argparse.Namespace) -> None:
         "ocr_lang": "ocr_languages",
         "illustrations": "illustrations",
         "image_model": "image_model",
+        "book_images": "book_images",
+        "vision_model": "vision_model",
     }
     for arg, field in mapping.items():
         value = getattr(args, arg, None)
@@ -199,11 +212,21 @@ def _cmd_voices(settings: Settings, language: str | None) -> None:
         print(f"\ndefault for {language}: {engine.default_voice(language)}", file=sys.stderr)
 
 
-def _cmd_models(settings: Settings, pull: str | None, pull_image: str | None = None) -> int:
+def _cmd_models(
+    settings: Settings,
+    pull: str | None,
+    pull_image: str | None = None,
+    pull_vision: str | None = None,
+) -> int:
     from . import imagegen
-    from .llm import RECOMMENDED, LocalLLM, list_local
+    from .llm import RECOMMENDED, LocalLLM, list_local, vision
     from .llm.store import download, format_size
 
+    if pull_vision:
+        vision.VisionLLM(pull_vision).prepare(_progress)
+        vision.unload()
+        print(f"\n{pull_vision} is ready")
+        return 0
     if pull_image:
         imagegen.ImageGenerator(pull_image).prepare(_progress)
         imagegen.unload()
@@ -239,13 +262,32 @@ def _cmd_models(settings: Settings, pull: str | None, pull_image: str | None = N
         marker = "*" if name == settings.image_model else " "
         print(f" {marker} {name:28s} {spec.note}")
     print(("   OK: " if image_status.ok else "   NOT READY: ") + image_status.message)
+    vision_status = vision.VisionLLM(settings.vision_model, settings.llm_auto_download).status()
+    print("\nVision models (describe the book's images for --book-images):")
+    for name, spec in vision.VISION_MODELS.items():
+        marker = "*" if name == settings.vision_model else " "
+        print(f" {marker} {name:28s} {spec.note}")
+    print(("   OK: " if vision_status.ok else "   NOT READY: ") + vision_status.message)
     return 0 if status.ok else 1
 
 
 def _cmd_script(doc: Document, settings: Settings, ctx: JobContext) -> Path:
+    from .video.bookimages import prepare_book_images
     from .video.script import build_script
 
     language = detect_language(doc.chapters[0].text if doc.chapters else "")
+    out_dir = doc.output_dir("video")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    book_images = {}
+    if settings.illustrations and settings.book_images and settings.video_script != "extractive":
+        book_images = prepare_book_images(
+            doc,
+            out_dir,
+            settings.vision_model,
+            settings.llm_auto_download,
+            ctx.progress,
+            ctx.check,
+        )
     script = build_script(
         doc,
         settings.video_script,
@@ -254,9 +296,8 @@ def _cmd_script(doc: Document, settings: Settings, ctx: JobContext) -> Path:
         on_progress=ctx.progress,
         check_cancel=ctx.check,
         illustrations=settings.illustrations,
+        book_images=book_images,
     )
-    out_dir = doc.output_dir("video")
-    out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "script.json"
     script.save(path)
     print(file=sys.stderr)
@@ -267,7 +308,11 @@ def _cmd_script(doc: Document, settings: Settings, ctx: JobContext) -> Path:
             extra = ""
             if ill is not None:
                 what = ill.diagram.type if ill.diagram else ill.prompt[:50]
+                if ill.book_image:
+                    what = f"from the book, {ill.book_image}"
                 extra = f"  [{ill.kind}: {what}, {ill.placement}, {ill.animation}]"
+                if ill.book_image_reason:
+                    extra += f"\n       ({ill.book_image_reason})"
             print(f"   - {scene.title}  ({len(scene.narration.split())} words){extra}")
     return path
 
@@ -285,7 +330,7 @@ def main(argv: list[str] | None = None) -> int:
         _cmd_voices(settings, args.language)
         return 0
     if args.command == "models":
-        return _cmd_models(settings, args.pull, args.pull_image)
+        return _cmd_models(settings, args.pull, args.pull_image, args.pull_vision)
 
     try:
         doc = _load(args, settings)

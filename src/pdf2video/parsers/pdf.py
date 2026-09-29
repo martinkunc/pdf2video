@@ -15,8 +15,9 @@ from pathlib import Path
 
 import pymupdf
 
-from ..model import Chapter, Document
+from ..model import Chapter, ChapterImage, Document
 from ..textutil import (
+    CAPTION_LINE,
     CHAPTER_LINE,
     detect_language,
     lines_to_paragraphs,
@@ -33,8 +34,15 @@ log = logging.getLogger(__name__)
 pymupdf.TOOLS.mupdf_display_errors(False)
 pymupdf.TOOLS.mupdf_display_warnings(False)
 
-MAX_IMAGES_PER_CHAPTER = 6
+MAX_IMAGES_PER_CHAPTER = 10
 MIN_IMAGE_SIDE = 200
+CAPTION_GAP = 40  # points between an image and its caption above/below
+SIDE_CAPTION_GAP = 250  # points between an image and its caption in the margin
+FIGURE_GAP = 25  # drawings closer than this (points) belong to the same figure
+MIN_FIGURE_SIDE = 60  # points
+LABEL_GAP = 15  # a short text this close to a drawing is one of its labels (points)
+LABEL_CHARS = 60
+FIGURE_PIXELS = 1200  # longest side of a cropped vector figure
 OCR_DPI = 300
 MIN_TEXT_CHARS = 25  # a page with less extractable text than this is treated as a scan
 TESSERACT_LANGS = {
@@ -198,13 +206,141 @@ def _chapters_from_fonts(flat: list[Line]) -> list[tuple[str, int]] | None:
     return starts
 
 
-def _chapter_images(doc: pymupdf.Document, pages: range, skip: set[int]) -> list[bytes]:
-    images: list[bytes] = []
+Block = tuple[pymupdf.Rect, str]
+
+
+def _text_blocks(page: pymupdf.Page) -> list[Block]:
+    return [
+        (pymupdf.Rect(b[:4]), normalize(" ".join(b[4].split())))
+        for b in page.get_text("blocks")
+        if b[6] == 0 and b[4].strip()
+    ]
+
+
+def _gap(a: pymupdf.Rect, b: pymupdf.Rect) -> float:
+    """Distance between two rectangles (0 if they touch or overlap)."""
+    dx = max(0.0, max(a.x0, b.x0) - min(a.x1, b.x1))
+    dy = max(0.0, max(a.y0, b.y0) - min(a.y1, b.y1))
+    return max(dx, dy)
+
+
+def _caption_block(blocks: list[Block], k: int) -> Block:
+    """Caption block ``k``; a bare label ("Figure 1.1") is joined with the text under it."""
+    rect, text = blocks[k]
+    if len(text) < 20:
+        below = [
+            (r, t)
+            for r, t in blocks
+            if 0 <= r.y0 - rect.y1 <= 12 and r.x0 < rect.x1 and r.x1 > rect.x0
+        ]
+        if below:
+            r, t = min(below, key=lambda b: b[0].y0)
+            rect, text = rect | r, f"{text} {t}"
+    return rect, text[:300]
+
+
+def _is_caption(text: str) -> bool:
+    """ "Figure 3: The heart" or a bare "Figure 1.1", but not "Figure 5.16 shows that …"."""
+    match = CAPTION_LINE.match(text)
+    rest = text[match.end() :].lstrip() if match else ""
+    return match is not None and not rest[:1].islower()
+
+
+def _captions(blocks: list[Block]) -> list[tuple[pymupdf.Rect, str]]:
+    return [_caption_block(blocks, k) for k, (_, t) in enumerate(blocks) if _is_caption(t)]
+
+
+def _caption_distance(figure: pymupdf.Rect, caption: pymupdf.Rect) -> float | None:
+    """How far ``caption`` is from ``figure``, or None if it can't be its caption.
+
+    Captions sit above or below the figure, or beside it in the page margin.
+    """
+    if caption.x0 < figure.x1 and caption.x1 > figure.x0:  # above / below
+        gap = max(0.0, caption.y0 - figure.y1, figure.y0 - caption.y1)
+        return gap if gap <= CAPTION_GAP else None
+    if caption.y0 < figure.y1 and caption.y1 > figure.y0:  # beside
+        gap = max(caption.x0 - figure.x1, figure.x0 - caption.x1)
+        return gap if gap <= SIDE_CAPTION_GAP else None
+    return None
+
+
+def _nearest_caption(rect: pymupdf.Rect, captions: list[tuple[pymupdf.Rect, str]]) -> str:
+    """The caption above, below or beside ``rect`` ("Figure 3: …"), if any."""
+    near = [(d, t) for r, t in captions if (d := _caption_distance(rect, r)) is not None]
+    return min(near)[1] if near else ""
+
+
+def _with_labels(region: pymupdf.Rect, blocks: list[Block], caption: pymupdf.Rect):
+    """``region`` grown by the text labels of the drawing: blocks inside or overlapping
+    it, and short ones just next to it (not body paragraphs, not the caption)."""
+    for _ in range(3):
+        grown = pymupdf.Rect(region)
+        for rect, text in blocks:
+            if rect.intersects(caption) or rect in grown:
+                continue
+            label = len(text) <= LABEL_CHARS and _gap(rect, grown) <= LABEL_GAP
+            if rect.intersects(grown) or label:
+                grown |= rect
+        if grown == region:
+            break
+        region = grown
+    return region
+
+
+def _vector_figures(
+    page: pymupdf.Page, blocks: list[Block], captions: list[tuple[pymupdf.Rect, str]]
+) -> list[ChapterImage]:
+    """Figures drawn with vector graphics, cropped from the page.
+
+    Only drawings next to a caption count, so boxes, rules and table borders
+    elsewhere on the page are not mistaken for figures.
+    """
+    if not captions:
+        return []
+    try:
+        clusters = [r for r in page.cluster_drawings() if r.width > 3 and r.height > 3]
+    except Exception:
+        return []
+    groups: list[pymupdf.Rect] = []  # clusters that are close together form one figure
+    for rect in sorted(clusters, key=lambda r: (r.y0, r.x0)):
+        for k, group in enumerate(groups):
+            if _gap(group, rect) <= FIGURE_GAP:
+                groups[k] = group | rect
+                break
+        else:
+            groups.append(pymupdf.Rect(rect))
+    figures: list[ChapterImage] = []
+    used: set[int] = set()
+    for cap_rect, caption in captions:
+        candidates = [
+            (d, k)
+            for k, g in enumerate(groups)
+            if k not in used and (d := _caption_distance(g, cap_rect)) is not None
+        ]
+        if not candidates:
+            continue
+        k = min(candidates)[1]
+        used.add(k)
+        region = _with_labels(pymupdf.Rect(groups[k]), blocks, cap_rect)
+        region = (region + (-6, -6, 6, 6)) & page.rect
+        if region.width < MIN_FIGURE_SIDE or region.height < MIN_FIGURE_SIDE:
+            continue
+        zoom = min(4.0, FIGURE_PIXELS / max(region.width, region.height))
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), clip=region, alpha=False)
+        figures.append(ChapterImage(pix.tobytes("png"), caption))
+    return figures
+
+
+def _chapter_images(doc: pymupdf.Document, pages: range, skip: set[int]) -> list[ChapterImage]:
+    images: list[ChapterImage] = []
     seen: set[int] = set()
     for page_no in pages:
         if page_no in skip:  # the "image" on a scanned page is the page itself
             continue
-        for img in doc[page_no].get_images(full=True):
+        page = doc[page_no]
+        blocks = _text_blocks(page)
+        captions = _captions(blocks)
+        for img in page.get_images(full=True):
             xref = img[0]
             if xref in seen:
                 continue
@@ -215,11 +351,16 @@ def _chapter_images(doc: pymupdf.Document, pages: range, skip: set[int]) -> list
                 pix = pymupdf.Pixmap(doc, xref)
                 if pix.n - pix.alpha >= 4:  # CMYK → RGB
                     pix = pymupdf.Pixmap(pymupdf.csRGB, pix)
-                images.append(pix.tobytes("png"))
+                rects = page.get_image_rects(xref)
+                caption = _nearest_caption(rects[0], captions) if rects else ""
+                images.append(ChapterImage(pix.tobytes("png"), caption))
             except Exception:
                 continue
-            if len(images) >= MAX_IMAGES_PER_CHAPTER:
-                return images
+        # Captions not taken by a raster image may belong to a vector figure.
+        taken = {i.caption for i in images}
+        images.extend(_vector_figures(page, blocks, [c for c in captions if c[1] not in taken]))
+        if len(images) >= MAX_IMAGES_PER_CHAPTER:
+            return images[:MAX_IMAGES_PER_CHAPTER]
     return images
 
 

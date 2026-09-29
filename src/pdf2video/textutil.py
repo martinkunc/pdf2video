@@ -270,3 +270,10 @@ CHAPTER_LINE = re.compile(
     r"\s+([0-9]+|[ivxlcdm]+|[a-z]+)\b.*$",
     re.IGNORECASE,
 )
+
+# Figure captions: "Figure 3.", "Fig. 2:", "Obr. 4", "Abb. 1", "Plate IV", …
+CAPTION_LINE = re.compile(
+    r"^\s*(fig(ure)?|obr(ázek)?|abb(ildung)?|illustration|plate|image|photo|map|chart"
+    r"|diagram|tab(le|ulka|elle)?|graf)\.?\s*[0-9ivxlcdm]+([.:\-–]\s*|\s|$)",
+    re.IGNORECASE,
+)

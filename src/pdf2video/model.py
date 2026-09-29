@@ -8,10 +8,18 @@ from pathlib import Path
 
 
 @dataclass
+class ChapterImage:
+    """An image embedded in the document (a figure, photo, map, …)."""
+
+    data: bytes  # encoded image file (PNG, JPEG, …)
+    caption: str = ""  # figure caption or alt text found in the document, if any
+
+
+@dataclass
 class Chapter:
     title: str
     paragraphs: list[str]
-    images: list[bytes] = field(default_factory=list)
+    images: list[ChapterImage] = field(default_factory=list)
     number: int = 0  # 1-based position in the full document (0 = not numbered)
 
     @property

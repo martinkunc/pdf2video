@@ -20,7 +20,10 @@ from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 from ..imagegen import IMAGE_MODELS, ImageGenerator  # noqa: E402
 from ..jobs import JobContext  # noqa: E402
 from ..llm import RECOMMENDED, LLMStatus, LocalLLM  # noqa: E402
+from ..llm import abort as abort_llm  # noqa: E402
 from ..llm.store import format_size  # noqa: E402
+from ..llm.vision import VisionLLM  # noqa: E402
+from ..llm.vision import abort as abort_vision  # noqa: E402
 from ..media import Cancelled, check_ffmpeg  # noqa: E402
 from ..model import Document  # noqa: E402
 from ..parsers import SUPPORTED_EXTENSIONS, load_document  # noqa: E402
@@ -68,6 +71,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.voices: list[Voice] = []
         self.voice_ids: list[str] = []
         self.job: JobContext | None = None
+        self.job_thread: threading.Thread | None = None
         self._updating_voices = False
         self.selected: set[int] = set()  # numbers of the chapters to process
         self.chapter_checks: dict[int, Gtk.CheckButton] = {}
@@ -258,6 +262,9 @@ class MainWindow(Adw.ApplicationWindow):
         self.image_model_row.set_selected(self.image_model_names.index(s.image_model))
         self.image_model_row.connect("notify::selected", self._on_image_model_changed)
         video.add(self.image_model_row)
+        self.book_images_row = Adw.SwitchRow(title="Book images", active=s.book_images)
+        self.book_images_row.connect("notify::active", self._on_book_images_changed)
+        video.add(self.book_images_row)
         self.content.append(video)
         self._update_illustrations_rows()
         self._check_llm()
@@ -513,6 +520,11 @@ class MainWindow(Adw.ApplicationWindow):
             self.settings.save()
             self._update_illustrations_rows()
 
+    def _on_book_images_changed(self, row, _pspec) -> None:
+        self.settings.book_images = row.get_active()
+        self.settings.save()
+        self._update_illustrations_rows()
+
     def _update_illustrations_rows(self) -> None:
         if self.settings.video_script == "extractive":
             text = "Needs the AI script (the original-text script has no illustrations)"
@@ -522,6 +534,12 @@ class MainWindow(Adw.ApplicationWindow):
         self.image_model_row.set_sensitive(self.settings.illustrations)
         status = ImageGenerator(self.settings.image_model, self.settings.llm_auto_download).status()
         self.image_model_row.set_subtitle(GLib.markup_escape_text(status.message))
+        self.book_images_row.set_sensitive(self.settings.illustrations)
+        vision = VisionLLM(self.settings.vision_model, self.settings.llm_auto_download).status()
+        text = "Use the book's own image where it fits a scene better than a generated picture"
+        if self.settings.book_images:
+            text += f" · {vision.message}"
+        self.book_images_row.set_subtitle(GLib.markup_escape_text(text))
 
     def _on_ocr_changed(self, row, _pspec) -> None:
         self.settings.ocr = OCR_MODES[row.get_selected()][0]
@@ -623,6 +641,13 @@ class MainWindow(Adw.ApplicationWindow):
         if current and current not in {v.id for v in matching}:
             extra = [v for v in self.voices if v.id == current]
             matching = extra + matching
+        engine = get_engine(self.settings.tts_engine)
+        supports = getattr(engine, "supports", None)
+        if self.language and supports is not None and not supports(self.language):
+            note = f"{engine.label.split(' (')[0]} has no voices for this language; "
+            self.voice_row.set_subtitle(note + "Automatic uses a Piper voice")
+        else:
+            self.voice_row.set_subtitle("")
         labels = ["Automatic (by language)"] + [v.label for v in matching]
         self.voice_ids = [""] + [v.id for v in matching]
         self._updating_voices = True
@@ -691,7 +716,8 @@ class MainWindow(Adw.ApplicationWindow):
                 traceback.print_exc()
                 _idle(self._on_job_done, kind, None, exc)
 
-        threading.Thread(target=work, daemon=True).start()
+        self.job_thread = threading.Thread(target=work, daemon=True)
+        self.job_thread.start()
 
     def _on_progress(self, fraction: float, message: str) -> None:
         if self.job is None:
@@ -699,9 +725,25 @@ class MainWindow(Adw.ApplicationWindow):
         self.progress.set_fraction(fraction)
         self.status.set_label(message)
 
-    def _on_cancel(self, _button) -> None:
+    def cancel_job(self) -> None:
+        """Cancel the running job, also stopping a model in the middle of an answer."""
         if self.job:
             self.job.cancel()
+            abort_llm()
+            abort_vision()
+
+    def stop_job(self, timeout: float) -> bool:
+        """Cancel the job and wait for its thread; False if it's still running."""
+        self.cancel_job()
+        thread = self.job_thread
+        if thread is not None:
+            thread.join(timeout)
+            return not thread.is_alive()
+        return True
+
+    def _on_cancel(self, _button) -> None:
+        if self.job:
+            self.cancel_job()
             self.status.set_label("Cancelling…")
             self.cancel_button.set_sensitive(False)
 

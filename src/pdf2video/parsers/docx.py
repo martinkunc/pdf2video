@@ -8,7 +8,7 @@ from pathlib import Path
 import docx
 from docx.oxml.ns import qn
 
-from ..model import Chapter, Document
+from ..model import Chapter, ChapterImage, Document
 from ..textutil import clean_paragraph
 
 _HEADING = re.compile(r"^(heading|nadpis|überschrift|titre|título)\s*(\d)$", re.IGNORECASE)
@@ -29,14 +29,16 @@ def _heading_level(paragraph) -> int | None:
 def load_docx(path: Path) -> Document:
     document = docx.Document(str(path))
     props = document.core_properties
-    items: list[tuple[int | None, str, list[bytes]]] = []
+    items: list[tuple[int | None, str, list[ChapterImage]]] = []
     for paragraph in document.paragraphs:
         text = clean_paragraph(paragraph.text)
-        images: list[bytes] = []
-        for rid in paragraph._p.xpath(".//a:blip/@r:embed"):
-            part = document.part.related_parts.get(rid)
+        images: list[ChapterImage] = []
+        for drawing in paragraph._p.xpath(".//w:drawing"):
+            rids = drawing.xpath(".//a:blip/@r:embed")
+            part = document.part.related_parts.get(rids[0]) if rids else None
             if part is not None and getattr(part, "blob", None):
-                images.append(part.blob)
+                alt = drawing.xpath(".//wp:docPr/@descr")  # the picture's alt text
+                images.append(ChapterImage(part.blob, clean_paragraph(alt[0] if alt else "")))
         if text or images:
             items.append((_heading_level(paragraph), text, images))
 

@@ -13,6 +13,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from ..media import Cancelled
 from .store import (
     RECOMMENDED,
     LocalModel,
@@ -40,6 +41,7 @@ MAX_OUTPUT_TOKENS = 4096
 _load_lock = threading.Lock()
 _infer_lock = threading.Lock()  # one generation at a time; unload() waits for it
 _loaded: tuple[str, object] | None = None  # (model path, llama_cpp.Llama) kept between jobs
+_abort_epoch = 0  # bumped by abort(); a running generation stops when it changes
 
 
 @dataclass
@@ -51,20 +53,43 @@ class LLMStatus:
     download_size: int | None = None
 
 
+def abort() -> None:
+    """Stop a running generation after its current token (it raises Cancelled)."""
+    global _abort_epoch
+    _abort_epoch += 1
+
+
+def stream_chat(llm, aborted: Callable[[], bool], **kwargs) -> tuple[str, str | None]:
+    """``create_chat_completion`` streamed token by token, so it can be stopped midway.
+
+    Returns the answer and its finish reason; raises Cancelled once ``aborted()``.
+    """
+    parts: list[str] = []
+    finish = None
+    for chunk in llm.create_chat_completion(stream=True, **kwargs):
+        if aborted():
+            raise Cancelled()
+        choice = chunk["choices"][0]
+        parts.append(choice["delta"].get("content") or "")
+        finish = choice.get("finish_reason") or finish
+    return "".join(parts), finish
+
+
 def unload() -> None:
-    """Free the cached model (and its Metal/GPU buffers).
+    """Free the cached model (and its Metal/GPU buffers), stopping a running generation.
 
     Must run before the process exits: llama.cpp's Metal backend asserts in its
     static destructor if a model is still alive (GGML_ASSERT rsets count == 0).
     """
     global _loaded
+    abort()
     with _load_lock:
         if _loaded is None:
             return
         llm = _loaded[1]
         _loaded = None
-    # Never free the model under a running generation (e.g. window closed mid-job).
-    if not _infer_lock.acquire(timeout=120):
+    # Never free the model under a running generation; abort() stops it within a token.
+    if not _infer_lock.acquire(timeout=10):
         log.warning("model still busy at shutdown; not freeing it")
         return
     try:
@@ -180,10 +205,15 @@ class LocalLLM:
             self.prepare()
         if self._no_think:
             user += "\n/no_think"  # Qwen3: skip the reasoning phase, answer directly
+        epoch = _abort_epoch
         with _infer_lock:  # a llama.cpp context is not thread-safe
+            if _abort_epoch != epoch:
+                raise Cancelled()
             if _loaded is None or _loaded[1] is not self._llm:
                 raise ModelError("the model was unloaded")
-            result = self._llm.create_chat_completion(
+            content, finish = stream_chat(
+                self._llm,
+                lambda: _abort_epoch != epoch,
                 messages=[
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
@@ -192,7 +222,6 @@ class LocalLLM:
                 max_tokens=MAX_OUTPUT_TOKENS,
                 temperature=0.4,
             )
-        choice = result["choices"][0]
-        if choice.get("finish_reason") == "length":
+        if finish == "length":
             raise ValueError("the model's answer was cut off")
-        return choice["message"]["content"] or ""
+        return content

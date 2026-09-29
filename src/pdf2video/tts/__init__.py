@@ -40,14 +40,20 @@ class TTSEngine(Protocol):
         ...
 
     # Optional: engines with downloadable voices also implement
-    # ``prepare(voice, on_progress)`` to fetch the voice before synthesis starts.
+    # ``prepare(voice, on_progress)`` to fetch the voice before synthesis starts,
+    # and engines for only some languages implement ``supports(language) -> bool``
+    # (the narrator then uses FALLBACK_ENGINE for the others).
 
 
 ENGINES = {
-    "edge": "Microsoft Edge neural voices (online)",
+    "kokoro": "Kokoro neural voices (offline, most natural; Piper for other languages)",
     "piper": "Piper neural voices (offline)",
+    "edge": "Microsoft Edge neural voices (online)",
     "macos": "macOS voices (offline)",
 }
+
+
+FALLBACK_ENGINE = "piper"
 
 
 def get_engine(name: str) -> TTSEngine:
@@ -64,6 +70,10 @@ def get_engine(name: str) -> TTSEngine:
             from .piper import PiperTTS
 
             return PiperTTS()
+        case "kokoro":
+            from .kokoro import KokoroTTS
+
+            return KokoroTTS()
     raise TTSError(f"Unknown TTS engine: {name}")
 
 

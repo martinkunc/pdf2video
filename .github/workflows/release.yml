@@ -1,0 +1,148 @@
+# Builds standalone packages (packaging/build.py) for Windows, macOS and Linux and
+# attaches them to the GitHub release. Can also be run by hand from the Actions tab;
+# the packages are then only uploaded as workflow artifacts.
+name: Release packages
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.13"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+          - name: macos-arm64
+            os: macos-14
+            cmake_args: -DSD_METAL=ON
+            macos_target: "14.0"
+          - name: macos-x86_64
+            os: macos-15-intel
+            macos_target: "15.0"
+          - name: windows-x86_64
+            os: windows-2022
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Version from the release tag
+        if: github.event_name == 'release'
+        shell: bash
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          echo "PDF2VIDEO_VERSION=${tag#v}" >> "$GITHUB_ENV"
+
+      # --- System dependencies -------------------------------------------------
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev libgirepository-2.0-dev \
+            libcairo2-dev gir1.2-gtk-4.0 gir1.2-adw-1 pkg-config cmake build-essential
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gtk4 libadwaita gobject-introspection pkg-config cairo cmake \
+            jpeg-turbo libtiff webp little-cms2 openjpeg freetype harfbuzz fribidi
+          echo "MACOSX_DEPLOYMENT_TARGET=${{ matrix.macos_target }}" >> "$GITHUB_ENV"
+          echo "HOMEBREW_PREFIX=$(brew --prefix)" >> "$GITHUB_ENV"
+
+      # GTK 4 + libadwaita built with MSVC by the gvsbuild project.
+      - name: Install GTK (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $release = gh release view --repo wingtk/gvsbuild --json assets | ConvertFrom-Json
+          $asset = $release.assets | Where-Object { $_.name -like 'GTK4_Gvsbuild_*_x64.zip' } |
+            Select-Object -First 1
+          gh release download --repo wingtk/gvsbuild --pattern $asset.name --dir $env:RUNNER_TEMP
+          Expand-Archive -Path (Join-Path $env:RUNNER_TEMP $asset.name) -DestinationPath C:\gtk
+          "C:\gtk\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "PKG_CONFIG_PATH=C:\gtk\lib\pkgconfig" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "GI_TYPELIB_PATH=C:\gtk\lib\girepository-1.0" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "XDG_DATA_DIRS=C:\gtk\share" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "INCLUDE=C:\gtk\include;C:\gtk\include\cairo;C:\gtk\include\glib-2.0;C:\gtk\include\gobject-introspection-1.0;C:\gtk\lib\glib-2.0\include;$env:INCLUDE" |
+            Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "LIB=C:\gtk\lib;$env:LIB" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: MSVC environment (Windows)
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: pkg-config (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command pkg-config -ErrorAction SilentlyContinue)) {
+            if (Test-Path C:\gtk\bin\pkgconf.exe) {
+              "PKG_CONFIG=C:\gtk\bin\pkgconf.exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+            } else {
+              choco install pkgconfiglite -y
+            }
+          }
+
+      # --- Python environment and build ----------------------------------------
+
+      # On macOS Pillow is built from source so it links the same Homebrew
+      # harfbuzz/freetype as GTK (the wheel's own copies break GTK in the bundle).
+      # pygobject/pycairo are built from source against the installed GTK everywhere.
+      - name: Python dependencies
+        shell: bash
+        env:
+          CMAKE_ARGS: ${{ matrix.cmake_args }}
+        run: |
+          args=(--locked --group build --no-dev)
+          if [ "$RUNNER_OS" = "macOS" ]; then args+=(--no-binary-package pillow); fi
+          uv sync "${args[@]}"
+
+      - name: Build package
+        shell: bash
+        run: uv run --no-sync python packaging/build.py
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            macOS) dist/pdf2video.app/Contents/MacOS/pdf2video --help ;;
+            Windows) dist/pdf2video/pdf2video-cli.exe --help ;;
+            *) dist/pdf2video/pdf2video --help ;;
+          esac
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pdf2video-${{ matrix.name }}
+          path: |
+            dist/pdf2video-*.zip
+            dist/pdf2video-*.dmg
+            dist/pdf2video-*.tar.gz
+          if-no-files-found: error
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          shopt -s nullglob
+          gh release upload "${{ github.event.release.tag_name }}" --clobber \
+            dist/pdf2video-*.zip dist/pdf2video-*.dmg dist/pdf2video-*.tar.gz

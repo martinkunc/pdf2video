@@ -15,6 +15,8 @@ documents into
 Scanned PDFs are read with **OCR** (Tesseract), and the OCR language is detected
 automatically.
 
+<img src="docs/screenshot.png">
+
 See [docs/DESIGN.md](docs/DESIGN.md) for the design.
 
 ## Install

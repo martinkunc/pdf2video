@@ -47,3 +47,18 @@ def test_bad_file(tmp_path, capsys):
 def test_chapter_selection_keeps_numbers(book, capsys):
     assert main(["info", str(book), "--chapters", "2"]) == 0
     assert "  2. Two" in capsys.readouterr().out
+
+
+def test_settings_round_trip(tmp_path, monkeypatch):
+    from pdf2video.settings import Settings
+
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert Settings().tts_engine == "kokoro"
+    Settings(illustrations=True, voice='a "b"', rate=1.2).save()
+    loaded = Settings.load()
+    assert loaded.illustrations and loaded.voice == 'a "b"' and loaded.rate == 1.2
+    # Files written by older versions (Python booleans) still load.
+    path = tmp_path / "pdf2video" / "settings.toml"
+    path.write_text('tts_engine = "edge"\nillustrations = True\nbook_images = False\n')
+    old = Settings.load()
+    assert old.tts_engine == "edge" and old.illustrations and not old.book_images

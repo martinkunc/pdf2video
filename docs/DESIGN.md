@@ -1,6 +1,7 @@
 # pdf2video — Design Document
 
-Status: v4 · 2026-09-26 (illustrations: LLM-designed diagrams and locally generated pictures)
+Status: v5 · 2026-09-27 (book images: the document's own images, summarised by a local
+vision model, replace generated pictures where they fit better)
 
 ## 1. Goal
 
@@ -82,16 +83,20 @@ src/pdf2video/
     text.py          .txt / .md
   tts/
     __init__.py      TTSEngine protocol + registry
-    edge.py          edge-tts (Microsoft neural voices, online, default)
+    kokoro.py        Kokoro-82M via kokoro-onnx (offline, default; Piper fallback)
+    piper.py         Piper voices (offline, 50+ languages)
+    edge.py          edge-tts (Microsoft neural voices, online)
     macos.py         macOS `say` (offline fallback)
   media.py           ffmpeg/ffprobe helpers (encode, concat, duration, still→video)
   audiobook.py       audiobook pipeline
   video/
     script.py        Document → VideoScript (local LLM, or extractive); illustration schema
     diagrams.py      Pillow diagram renderer (flow, cycle, hierarchy, hub, comparison, …)
+    bookimages.py    the document's own images: saved, summarised, catalogued
   llm/
     __init__.py      LocalLLM: built-in llama.cpp runner (load, JSON-constrained chat)
     store.py         model lookup (Ollama folder, app cache) + registry download
+    vision.py        VisionLLM: local vision-language model that describes images
     slides.py        Pillow slide renderer (1920×1080)
     builder.py       video pipeline
   imagegen.py        local text-to-image (stable-diffusion.cpp) + model registry/download
@@ -109,10 +114,15 @@ testable without a display.
 
 ```python
 @dataclass
+class ChapterImage:
+    data: bytes                # encoded image (PNG, JPEG, …)
+    caption: str = ""          # figure caption (PDF), figcaption/alt (EPUB), alt text (DOCX)
+
+@dataclass
 class Chapter:
     title: str
     paragraphs: list[str]
-    images: list[bytes] = []   # optional, used by video slides (PDF/EPUB/DOCX)
+    images: list[ChapterImage] = []   # optional, used by video slides (PDF/EPUB/DOCX)
 
 @dataclass
 class Document:
@@ -178,7 +188,26 @@ class TTSEngine(Protocol):
     def synthesize(self, text: str, voice: str, rate: float, out: Path) -> None: ...
 ```
 
-- **edge-tts (default)**: high-quality neural voices, many languages, no API
+- **Kokoro (default, offline neural)**: Kokoro-82M (Apache-2.0) run with ONNX
+  Runtime through `kokoro-onnx`, with espeak-ng phonemisation. It has much more
+  natural intonation than Piper. `kokoro-v1.0.onnx` (326 MB, fp32) and
+  `voices-v1.0.bin` (28 MB) come from the kokoro-onnx GitHub release. They are
+  pinned by size and sha256, downloaded with the store's `fetch_file` into
+  `~/.cache/pdf2video/kokoro`, and fetched in `prepare()`. The voice id's first
+  letter is its language (a = en-US, b = en-GB, e = es, f = fr, h = hi, i = it,
+  p = pt-BR); Japanese and Chinese are left out because they need extra
+  phonemisers. Defaults: `af_heart`, `ef_dora`, `ff_siwis`, `if_sara`,
+  `pf_dora`, `hf_alpha`. kokoro-onnx splits long text into ≤ 510-phoneme batches
+  and adds pauses at sentence (0.25 s) and clause (0.1 s) marks. The engine
+  synthesises paragraph by paragraph and puts 0.45 s of silence between them.
+  Speed maps to `speed = rate` (0.5–2.0). One synthesis runs at a time, since
+  ONNX Runtime already uses all cores; that gives about 6–8× real time on an
+  M-series CPU. Output is 24 kHz WAV.
+  Engines that cover only some languages implement `supports(language)`. When
+  the document's language isn't covered and no voice was picked explicitly, the
+  `Narrator` switches to `FALLBACK_ENGINE` (Piper), e.g. for Czech. The GUI says
+  so under the voice row.
+- **edge-tts**: high-quality neural voices, many languages, no API
   key, fast. Needs an internet connection. The output is MP3.
 - **macOS `say` (offline fallback)**: always available on macOS. It writes AIFF,
   which is converted to MP3.
@@ -389,6 +418,59 @@ class Illustration(BaseModel):
 - Illustrations are ignored when the setting is off, even if `script.json`
   contains them, and they are never produced by the extractive script.
 
+#### Book images instead of generated pictures
+
+With illustrations on, the document's **own images** (setting `book_images`,
+default on; CLI `--book-images/--no-book-images`) compete with the generated
+pictures:
+
+1. **Capture.** The parsers keep every chapter image together with its caption:
+   a PDF text block just above/below the image that looks like a caption
+   (`Figure 3:`, `Fig. 2`, `Obr. 4`, `Abb. 1`, `Table 2`, …), an EPUB
+   `<figcaption>` or `alt`, or a DOCX picture's alt text. `bookimages.collect`
+   saves them (deduplicated, at least 200 px) as
+   `<stem>_video/book_images/<chapter>-<sha256[:8]>.<png|jpg>`.
+2. **Summary.** A local vision-language model (`llm/vision.py`, llama.cpp with
+   libmtmd via `MTMDChatHandler`) looks at each image (downscaled to 896 px) and
+   answers, JSON-constrained, with a `kind` (photo, painting, drawing, diagram,
+   chart, map, table, text, decorative) and a 1–3 sentence English
+   `description`; the book's caption is given as a hint. The results go to
+   `<stem>_video/book_images.json`, keyed by the image's sha256, so re-runs only
+   describe new images. Images of kind *text* or *decorative*, and images that
+   have neither a description nor a caption, are not offered.
+
+   | name | files | notes |
+   |---|---|---|
+   | `qwen3-vl-4b` (default) | 3.0 GB (Q4_K_M + Q8 projector) | Qwen/Qwen3-VL-4B-Instruct-GGUF |
+   | `gemma3-4b` | 3.3 GB (Q4_K_M + f16 projector) | ggml-org/gemma-3-4b-it-GGUF |
+
+   Files are pinned by size and sha256 and fetched with the store's resumable
+   `fetch_file` into `~/.cache/pdf2video/vision-models`. The script LLM is
+   unloaded first and the vision model right after, so they never share memory.
+   If the vision model is unavailable, images keep only their captions.
+3. **Choice.** After the script of a chapter is written, `choose_book_images`
+   sends one more request to the script LLM: the chapter's image summaries
+   (numbered) and, for every scene that got a *picture*, its title, the start of
+   its narration and the generated picture's prompt (i.e. the summary of the
+   picture that would be generated). The model answers per scene with a book
+   image number or `null` (keep the generated picture) and a one-sentence
+   reason. It is told to prefer the book's image when it shows the scene's
+   subject (it is authentic and what the text refers to), and to keep the
+   generated picture when nothing fits or the image is mostly text/a table.
+   Each book image is used at most once; invalid numbers are ignored. A failing
+   request keeps the generated pictures.
+4. **Result.** The choice is stored on the illustration in `script.json`
+   (`book_image`: the file, `book_image_reason`); `prompt`, `placement` and
+   `animation` stay, so the book image gets the same framing and motion. The
+   builder does not generate those pictures (`image` points at the book file).
+   Clearing `book_image` in `script.json` brings the generated picture back; a
+   missing file falls back to generating. The choice happens *before*
+   generation, so no time is spent on pictures that are then replaced.
+
+With `book_images` on, AI scenes show the book's images only where the AI chose
+them. Otherwise (setting off, extractive script) the old behaviour stays: scene
+k shows the chapter's k-th image next to the bullets.
+
 ### 3.6 Local model runner and model store
 
 Goals: no separate LLM server to install, reuse models the user already has, and
@@ -456,7 +538,7 @@ Parsing also runs in a thread, so large PDFs never freeze the UI.
 | PDF | **PyMuPDF** | fastest and most accurate text + TOC + font info |
 | DOCX | **python-docx** | standard |
 | EPUB | **ebooklib** + **beautifulsoup4**/lxml | standard |
-| TTS | **edge-tts** (default), **Piper** (offline neural), macOS `say` | best online quality; offline neural voices incl. Czech; system fallback |
+| TTS | **Kokoro** (default, offline neural), **Piper** (offline neural), **edge-tts**, macOS `say` | most natural offline voices; offline voices incl. Czech; best online coverage; system fallback |
 | Audio/video | **ffmpeg** (system binary) via `subprocess` | robust, no heavy Python wrappers |
 | Slides | **Pillow** | simple, no browser dependency |
 | AI script | **llama-cpp-python** (built-in), GGUF models, default `qwen3:8b` | runs in-process, no server; grammar-constrained JSON; reuses Ollama's downloaded models |
@@ -484,7 +566,7 @@ GObject-Introspection, so these libraries must be installed first.
 `settings.toml`:
 ```toml
 max_chapter_minutes = 10
-tts_engine = "edge"          # "edge" | "piper" | "macos"
+tts_engine = "kokoro"        # "kokoro" | "piper" | "edge" | "macos"
 voice = "en-US-AndrewMultilingualNeural"
 rate = 1.0                   # speaking speed multiplier
 video_script = "auto"        # "auto" | "ai" | "extractive"
@@ -494,6 +576,8 @@ ocr = "auto"                 # "auto" | "always" | "off"
 ocr_languages = "auto"       # e.g. "eng+ces"
 illustrations = false        # AI adds diagrams / generated pictures to some scenes
 image_model = "sdxl-turbo"   # "sdxl-turbo" | "z-image-turbo" | path to a checkpoint
+book_images = true           # with illustrations: use the book's own image where it fits better
+vision_model = "qwen3-vl-4b" # "qwen3-vl-4b" | "gemma3-4b"; describes the book's images
 ```
 
 ## 6. Testing
@@ -512,6 +596,12 @@ image_model = "sdxl-turbo"   # "sdxl-turbo" | "z-image-turbo" | path to a checkp
   and an end-to-end video with a fake image generator (reveal, fade, zoom, pan,
   static pictures; decodes cleanly; pictures cached and reused; ignored when
   the setting is off).
+- Book image tests: captions from PDF/EPUB/DOCX; saving, dedup, size filter,
+  summaries cached in `book_images.json` (fake vision model), captions only when
+  the vision model is unavailable; the choice request and its validation
+  (unknown scenes, reuse, invalid numbers), integration into `build_script`
+  with failure fallback, and a video that shows a chosen book image and
+  generates a picture for a missing one.
 - Unit tests: text cleanup, sentence chunking, balanced part splitting,
   filename sanitising, and the chapter detection for each format (small
   fixtures generated in tests: PDF via PyMuPDF, DOCX via python-docx, EPUB via
@@ -523,7 +613,11 @@ image_model = "sdxl-turbo"   # "sdxl-turbo" | "z-image-turbo" | path to a checkp
 
 ## 7. Future work
 
-- Offline neural TTS (Kokoro / Piper) engine.
+- Text normalisation for the ear before synthesis (abbreviations, numbers,
+  parentheses, figure references), for all engines.
 - Chapter-marked single-file M4B output.
-- Page crops from the PDF as illustrations.
+- Page crops from the PDF as illustrations (vector figures are not captured as
+  images yet).
+- Offer book images to scenes without a planned picture, and compare book
+  figures with generated diagrams.
 - Image-to-video models for real animation once they run fast enough locally.

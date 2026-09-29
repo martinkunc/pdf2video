@@ -274,3 +274,17 @@ def test_image_model_registry(tmp_path, monkeypatch):
     custom = tmp_path / "model.safetensors"
     custom.write_bytes(b"x")
     assert imagegen.resolve(str(custom)).files[0].name == str(custom)
+
+
+def test_clean_illustration_drops_unusable_visuals():
+    # Image models can't draw text: no pictures of flowcharts or charts…
+    flowchart = Illustration(kind="picture", prompt="A flowchart of the Volere process steps")
+    assert clean_illustration(flowchart) is None
+    # …but asking for "no text, no charts" is fine.
+    ok = Illustration(kind="picture", prompt="A busy office at dawn, no text, no charts")
+    assert clean_illustration(ok) is not None
+    # A comparison without traits would show empty panels.
+    empty = _diagram("comparison", 2)
+    empty.diagram.items[1].detail = ""
+    assert clean_illustration(empty) is None
+    assert clean_illustration(_diagram("comparison", 2)) is not None

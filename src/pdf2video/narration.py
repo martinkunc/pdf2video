@@ -11,7 +11,7 @@ from . import media
 from .jobs import JobContext
 from .settings import Settings
 from .textutil import detect_language
-from .tts import TTSEngine, get_engine, synthesize_with_retry
+from .tts import FALLBACK_ENGINE, TTSEngine, get_engine, synthesize_with_retry
 
 MAX_WORKERS = 4
 
@@ -29,6 +29,9 @@ class Narrator:
         self.language = detect_language(sample_text)
         voice = settings.voice
         if not voice or voice not in {v.id for v in self.engine.voices()}:
+            supports = getattr(self.engine, "supports", None)
+            if supports is not None and not supports(self.language):
+                self.engine = get_engine(FALLBACK_ENGINE)  # e.g. Czech with Kokoro
             voice = self.engine.default_voice(self.language)
         self.voice = voice
 

@@ -1,6 +1,32 @@
-.venv/
+# Python
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tools
 .pytest_cache/
 .ruff_cache/
-dist/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Packaging (packaging/build.py, PyInstaller)
+/build/
+/dist/
+/packaging/ffmpeg/
+
+# Output written next to documents when trying the app in the repo
+*_audio/
+*_video/
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env

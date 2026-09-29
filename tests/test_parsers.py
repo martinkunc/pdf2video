@@ -62,12 +62,14 @@ def test_epub_toc(tmp_path: Path):
         epub.EpubImage(file_name="img/pic.png", media_type="image/png", content=png.getvalue())
     )
     chapters = []
-    for i, name in enumerate(["One", "Two"], 1):
+    figures = [
+        '<figure><img src="img/pic.png" alt="ignored"/><figcaption>Fig. 1 A red flag</figcaption>'
+        "</figure>",
+        '<div><img src="img/pic.png" alt="A red square"/></div>',
+    ]
+    for i, (name, figure) in enumerate(zip(["One", "Two"], figures, strict=True), 1):
         c = epub.EpubHtml(title=name, file_name=f"c{i}.xhtml")
-        c.content = (
-            f"<html><body><h1>{name}</h1><p>{_paragraph(2)}</p>"
-            '<div><img src="img/pic.png"/></div></body></html>'
-        )
+        c.content = f"<html><body><h1>{name}</h1><p>{_paragraph(2)}</p>{figure}</body></html>"
         book.add_item(c)
         chapters.append(c)
     book.toc = chapters
@@ -82,6 +84,47 @@ def test_epub_toc(tmp_path: Path):
     assert [c.title for c in doc.chapters] == ["One", "Two"]
     assert doc.chapters[0].paragraphs[0].startswith("Sentence number 0")
     assert len(doc.chapters[1].images) == 1
+    assert doc.chapters[0].images[0].caption == "Fig. 1 A red flag"
+    assert doc.chapters[1].images[0].caption == "A red square"
+
+
+def _png(size=(300, 200), color="red") -> bytes:
+    data = io.BytesIO()
+    Image.new("RGB", size, color).save(data, "PNG")
+    return data.getvalue()
+
+
+def test_docx_image_alt_text(tmp_path: Path):
+    d = docx.Document()
+    d.add_heading("Alpha", level=1)
+    d.add_paragraph(_paragraph(3))
+    d.add_picture(io.BytesIO(_png()))
+    d.inline_shapes[0]._inline.docPr.set("descr", "A red square")
+    d.add_heading("Beta", level=1)
+    d.add_paragraph("Beta text.")
+    f = tmp_path / "pics.docx"
+    d.save(f)
+    doc = load_document(f)
+    alpha = next(c for c in doc.chapters if c.title == "Alpha")
+    assert [i.caption for i in alpha.images] == ["A red square"]
+    assert Image.open(io.BytesIO(alpha.images[0].data)).size == (300, 200)
+
+
+def test_pdf_image_caption(tmp_path: Path):
+    pdf = pymupdf.open()
+    for title in ["First", "Second"]:
+        page = pdf.new_page()
+        page.insert_text((72, 90), title, fontsize=24)
+        page.insert_text((72, 120), f"Some body text of {title} with words.", fontsize=11)
+    page = pdf[1]
+    page.insert_image(pymupdf.Rect(72, 150, 372, 350), stream=_png())
+    page.insert_text((72, 370), "Figure 2: A red rectangle", fontsize=10)
+    pdf.set_toc([[1, "First", 1], [1, "Second", 2]])
+    f = tmp_path / "figs.pdf"
+    pdf.save(f)
+    doc = load_document(f)
+    assert doc.chapters[0].images == []
+    assert [i.caption for i in doc.chapters[1].images] == ["Figure 2: A red rectangle"]
 
 
 def _make_pdf(path: Path, with_toc: bool) -> None:
@@ -140,3 +183,34 @@ def test_malformed_pdf_is_repaired_quietly(tmp_path: Path, capfd, caplog):
     assert "MuPDF error" not in capfd.readouterr().err  # nothing printed by the C library
     assert any("invalid key in dict" in r.getMessage() for r in caplog.records)
     assert any(r.levelno == logging.INFO and "repaired" in r.getMessage() for r in caplog.records)
+
+
+def test_pdf_vector_figure_with_margin_caption(tmp_path: Path):
+    pdf = pymupdf.open()
+    for title in ["First", "Second"]:
+        page = pdf.new_page()
+        page.insert_text((72, 90), title, fontsize=24)
+        page.insert_text((150, 120), "Figure 9 shows how it works, as explained here.", fontsize=11)
+    page = pdf[1]
+    # A drawing with a label, and its caption in the left margin.
+    shape = page.new_shape()
+    shape.draw_rect(pymupdf.Rect(250, 300, 450, 450))
+    shape.draw_line((250, 300), (450, 450))
+    shape.draw_circle((350, 375), 40)
+    shape.finish(color=(0, 0, 0), width=2)
+    shape.commit()
+    page.insert_text((260, 470), "Cost of the software", fontsize=10)
+    page.insert_text((40, 308), "Figure 1.1", fontsize=9)
+    page.insert_text((40, 330), "The cost grows faster.", fontsize=9)
+    # A box elsewhere without a caption is not a figure.
+    page.draw_rect(pymupdf.Rect(150, 150, 450, 200), color=(0, 0, 0))
+    pdf.set_toc([[1, "First", 1], [1, "Second", 2]])
+    f = tmp_path / "vector.pdf"
+    pdf.save(f)
+    doc = load_document(f)
+    assert doc.chapters[0].images == []  # "Figure 9 shows …" is body text, not a caption
+    [figure] = doc.chapters[1].images
+    assert figure.caption == "Figure 1.1 The cost grows faster."
+    crop = Image.open(io.BytesIO(figure.data))
+    # The crop covers the drawing and its label (about 212×182 pt), not the page.
+    assert 1.0 < crop.width / crop.height < 1.4 and max(crop.size) >= 800  # zoom ≤ 4

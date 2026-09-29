@@ -11,7 +11,7 @@ import ebooklib
 from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from ebooklib import epub
 
-from ..model import Chapter, Document
+from ..model import Chapter, ChapterImage, Document
 from ..textutil import clean_paragraph
 
 warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
@@ -86,6 +86,15 @@ def _fragment_markers(soup: BeautifulSoup, doc_starts: dict[str | None, str]) ->
     return markers
 
 
+def _caption(img) -> str:
+    """The enclosing <figure>'s <figcaption>, else the image's alt/title text."""
+    figure = img.find_parent("figure")
+    caption = figure.find("figcaption") if figure is not None else None
+    if caption is not None and (text := clean_paragraph(caption.get_text(" "))):
+        return text[:300]
+    return clean_paragraph(img.get("alt") or img.get("title") or "")[:300]
+
+
 def load_epub(path: Path) -> Document:
     book = epub.read_epub(str(path), options={"ignore_ncx": False})
     titles = book.get_metadata("DC", "title")
@@ -122,7 +131,7 @@ def load_epub(path: Path) -> Document:
                 if src and len(chapters[-1].images) < _MAX_IMAGES:
                     img = book.get_item_with_href(posixpath.normpath(posixpath.join(base, src)))
                     if img is not None:
-                        chapters[-1].images.append(img.get_content())
+                        chapters[-1].images.append(ChapterImage(img.get_content(), _caption(el)))
                 continue
             text = clean_paragraph(el.get_text(" "))
             if text:
